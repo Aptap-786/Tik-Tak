@@ -4,7 +4,7 @@ const WebSocket = require('ws');
 const axios = require('axios');
 
 const PORT = process.env.PORT || 3000;
-const BOT_TOKEN = "8468676540:AAFsb4SPSlAD-5dNUmbQARL5Sj9cXlO7Oac";
+const BOT_TOKEN = "7987760307:AAEKVDBUZqMtncjLE2zbYBiqsVsYNELJEDo";
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // ═══════════════════════════════════════════════════════════════
